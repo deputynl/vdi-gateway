@@ -1,0 +1,10 @@
+# Real credentials: never commit.
+.env
+# Local deployment settings (network, ports, labels).
+docker-compose.override.yml
+# Editor leftovers
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

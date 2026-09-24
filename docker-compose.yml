@@ -1,0 +1,30 @@
+name: vdi-gateway
+
+services:
+  vdi-gateway:
+    image: ghcr.io/deputynl/vdi-gateway:latest
+    restart: unless-stopped
+    # Xvnc and FreeRDP share frame buffers via MIT-SHM; 64 MB is too small for
+    # large browser windows.
+    shm_size: 512m
+    ports:
+      # Only the reverse proxy should reach this port.
+      - 127.0.0.1:8080:8080
+    environment:
+      TARGET_HOST: ${TARGET_HOST:?set TARGET_HOST in .env}
+      TARGET_PORT: ${TARGET_PORT:-3389}
+      RDP_USERNAME: ${RDP_USERNAME:?set RDP_USERNAME in .env}
+      RDP_PASSWORD: ${RDP_PASSWORD:?set RDP_PASSWORD in .env}
+      RDP_DOMAIN: ${RDP_DOMAIN:-}
+      RDP_CERT_MODE: ${RDP_CERT_MODE:-ignore}
+      KEYBOARD_LAYOUT: ${KEYBOARD_LAYOUT:-}
+      FREERDP_EXTRA_ARGS: ${FREERDP_EXTRA_ARGS:-}
+      KASM_USER: ${KASM_USER:-kasm}
+      KASM_PASSWORD: ${KASM_PASSWORD:-}
+      LISTEN_PORT: 8080
+    volumes:
+      # Known-hosts store for RDP_CERT_MODE=tofu.
+      - freerdp-config:/home/app/.config/freerdp
+
+volumes:
+  freerdp-config:
