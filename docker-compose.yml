@@ -25,6 +25,7 @@ services:
       KASM_PASSWORD: ${KASM_PASSWORD:-}
       LISTEN_PORT: 8080
       AUDIO: ${AUDIO:-on}
+      MIC: ${MIC:-on}
       AUDIO_PORT: 8081
     volumes:
       # Known-hosts store for RDP_CERT_MODE=tofu.

@@ -36,10 +36,14 @@ RDP_CERT_MODE=${RDP_CERT_MODE:-ignore}
 KASM_USER=${KASM_USER:-kasm}
 AUDIO=${AUDIO:-on}
 AUDIO_PORT=${AUDIO_PORT:-8081}
+MIC=${MIC:-on}
 [[ $TARGET_PORT =~ ^[0-9]+$ ]] || die "TARGET_PORT must be a number"
 [[ $LISTEN_PORT =~ ^[0-9]+$ ]] || die "LISTEN_PORT must be a number"
 [[ $AUDIO_PORT =~ ^[0-9]+$ ]] || die "AUDIO_PORT must be a number"
 [[ $AUDIO == on || $AUDIO == off ]] || die "AUDIO must be 'on' or 'off', got '$AUDIO'"
+[[ $MIC == on || $MIC == off ]] || die "MIC must be 'on' or 'off', got '$MIC'"
+# The microphone travels over the audio WebSocket.
+[[ $AUDIO == on ]] || MIC=off
 [[ $RDP_CERT_MODE == ignore || $RDP_CERT_MODE == tofu ]] ||
     die "RDP_CERT_MODE must be 'ignore' or 'tofu', got '$RDP_CERT_MODE'"
 
@@ -122,8 +126,10 @@ start wm matchbox-window-manager -use_titlebar no -use_cursor yes -force_dialogs
 critical[$pid]="window manager"
 
 # ----------------------------------------------------------------- audio ---
-# FreeRDP plays into a PulseAudio null sink; vdi-audio-server streams its
-# monitor to the browser over WebSocket on AUDIO_PORT.
+# FreeRDP plays into the PulseAudio null sink "rdp"; vdi-audio-server streams
+# its monitor to the browser over WebSocket on AUDIO_PORT. The browser's
+# microphone goes the other way: into the "mic" sink, whose monitor FreeRDP
+# records.
 if [[ $AUDIO == on ]]; then
     export PULSE_SERVER=unix:$run_dir/pulse.sock
     # Keep Pulse's runtime, state and cookie files in the private run dir.
@@ -132,7 +138,8 @@ if [[ $AUDIO == on ]]; then
     start pulse pulseaudio --daemonize=no --system=no -n \
         --exit-idle-time=-1 --realtime=no --high-priority=no --log-target=stderr \
         -L "module-native-protocol-unix socket=$run_dir/pulse.sock auth-anonymous=1" \
-        -L "module-null-sink sink_name=rdp rate=48000 channels=2 sink_properties=device.description=RDP"
+        -L "module-null-sink sink_name=rdp rate=48000 channels=2 sink_properties=device.description=RDP" \
+        -L "module-null-sink sink_name=mic rate=48000 channels=1 sink_properties=device.description=Microphone"
     critical[$pid]=PulseAudio
     for _ in $(seq 50); do
         pactl info >/dev/null 2>&1 && break
@@ -141,10 +148,10 @@ if [[ $AUDIO == on ]]; then
     done
     pactl info >/dev/null 2>&1 || die "PulseAudio did not come up"
 
-    export AUDIO_PORT
+    export AUDIO_PORT MIC
     start audio vdi-audio-server < <(printf '%s\n' "$audio_auth")
     critical[$pid]="audio server"
-    log "audio enabled, WebSocket on port $AUDIO_PORT (route /vdi-audio to it)"
+    log "audio enabled (microphone: $MIC), WebSocket on port $AUDIO_PORT (route /vdi-audio to it)"
 else
     log "audio disabled"
 fi
@@ -165,6 +172,7 @@ freerdp_args=(
 [[ -z ${RDP_DOMAIN:-} ]] || freerdp_args+=("/d:$RDP_DOMAIN")
 [[ -z ${KEYBOARD_LAYOUT:-} ]] || freerdp_args+=("/kbd:layout:$KEYBOARD_LAYOUT")
 [[ $AUDIO == off ]] || freerdp_args+=(/sound:sys:pulse,dev:rdp)
+[[ $MIC == off ]] || freerdp_args+=(/microphone:sys:pulse,dev:mic.monitor)
 read -r -a extra_args <<<"${FREERDP_EXTRA_ARGS:-}"
 freerdp_args+=("${extra_args[@]}")
 unset rdp_password

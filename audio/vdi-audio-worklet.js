@@ -52,3 +52,41 @@ class VdiAudio extends AudioWorkletProcessor {
 }
 
 registerProcessor("vdi-audio", VdiAudio);
+
+// Microphone: resamples the first input channel from the context's rate to
+// 48 kHz (linear interpolation) and posts 20 ms chunks of mono s16le.
+const MIC_RATE = 48000;
+const MIC_CHUNK = MIC_RATE / 50;
+
+class VdiMic extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.step = sampleRate / MIC_RATE;
+        this.pos = 0;      // read position in the current block; -1 = prev
+        this.prev = 0;     // last sample of the previous block
+        this.chunk = new Int16Array(MIC_CHUNK);
+        this.n = 0;
+    }
+
+    process(inputs) {
+        const input = inputs[0][0];
+        if (!input) return true;
+        while (this.pos < input.length - 1) {
+            const i = Math.floor(this.pos);
+            const a = i < 0 ? this.prev : input[i];
+            const v = a + (input[i + 1] - a) * (this.pos - i);
+            this.chunk[this.n++] = Math.max(-32768, Math.min(32767, Math.round(v * 32768)));
+            if (this.n === MIC_CHUNK) {
+                this.port.postMessage(this.chunk.buffer, [this.chunk.buffer]);
+                this.chunk = new Int16Array(MIC_CHUNK);
+                this.n = 0;
+            }
+            this.pos += this.step;
+        }
+        this.pos -= input.length;
+        this.prev = input[input.length - 1];
+        return true;
+    }
+}
+
+registerProcessor("vdi-mic", VdiMic);

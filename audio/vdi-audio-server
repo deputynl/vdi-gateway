@@ -1,10 +1,17 @@
 #!/usr/bin/python3 -u
-"""Streams the "rdp" PulseAudio null sink to browsers over WebSocket.
+"""Carries the remote desktop's audio between PulseAudio and browsers.
 
-FreeRDP plays the remote desktop's audio into that sink; every connected
-browser gets its monitor as binary messages of raw PCM (s16le, 48 kHz,
-stereo, 20 ms each). Silent chunks are not sent, so an idle desktop costs no
-bandwidth. vdi-audio.js in the web client plays them.
+Playback: FreeRDP plays the remote desktop's audio into the "rdp" null sink;
+every connected browser gets its monitor as binary messages of raw PCM
+(s16le, 48 kHz, stereo, 20 ms each). Silent chunks are not sent, so an idle
+desktop costs no bandwidth.
+
+Microphone (MIC=on): browsers send binary messages of raw PCM (s16le, 48 kHz,
+mono), which are played into the "mic" null sink. FreeRDP records its monitor
+as the remote desktop's microphone.
+
+The first message to each browser is a text message with the settings, e.g.
+{"mic": true}. vdi-audio.js in the web client is the other end.
 
 The expected Authorization header ("Basic ..." or an empty line for none) is
 read from stdin so the KasmVNC password never appears in argv or environ.
@@ -12,6 +19,7 @@ read from stdin so the KasmVNC password never appears in argv or environ.
 import asyncio
 import hmac
 import http
+import json
 import logging
 import os
 import sys
@@ -20,9 +28,9 @@ from urllib.parse import urlsplit
 import websockets
 
 PORT = int(os.environ.get("AUDIO_PORT", "8081"))
-SOURCE = "rdp.monitor"
-RATE, CHANNELS = 48000, 2
-CHUNK = RATE // 50 * CHANNELS * 2  # 20 ms of s16le
+MIC = os.environ.get("MIC", "off") == "on"
+RATE = 48000
+CHUNK = RATE // 50 * 2 * 2  # 20 ms of stereo s16le
 SILENCE = bytes(CHUNK)
 
 expected_auth = sys.stdin.readline().strip()
@@ -45,11 +53,17 @@ async def check_request(path, headers):
     return None
 
 
-async def stream(ws, path=None):
-    print("client connected", flush=True)
+async def stop(proc):
+    if proc is not None and proc.returncode is None:
+        proc.kill()
+        await proc.wait()
+
+
+async def play(ws):
+    """Send the rdp sink's monitor to the browser."""
     proc = await asyncio.create_subprocess_exec(
-        "parec", f"--device={SOURCE}", "--raw", "--format=s16le",
-        f"--rate={RATE}", f"--channels={CHANNELS}", "--latency-msec=20",
+        "parec", "--device=rdp.monitor", "--raw", "--format=s16le",
+        f"--rate={RATE}", "--channels=2", "--latency-msec=20",
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
     )
     try:
@@ -59,22 +73,56 @@ async def stream(ws, path=None):
                 await ws.send(data)
     except asyncio.IncompleteReadError:
         print(f"parec exited (code {await proc.wait()})", flush=True)
-    except websockets.ConnectionClosed:
-        pass
     finally:
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-        print("client disconnected", flush=True)
+        await stop(proc)
+
+
+async def record(ws):
+    """Play the browser's microphone into the mic sink. Also notices the
+    browser disconnecting, whether or not it sends anything."""
+    proc = None
+    try:
+        async for msg in ws:
+            if not MIC or not isinstance(msg, bytes):
+                continue
+            if proc is None:
+                proc = await asyncio.create_subprocess_exec(
+                    "pacat", "--playback", "--device=mic", "--raw",
+                    "--format=s16le", f"--rate={RATE}", "--channels=1",
+                    "--latency-msec=60",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                )
+                print("microphone stream started", flush=True)
+            proc.stdin.write(msg)
+            await proc.stdin.drain()
+    finally:
+        await stop(proc)
+
+
+async def handle(ws, path=None):
+    print("client connected", flush=True)
+    await ws.send(json.dumps({"mic": MIC}))
+    tasks = [asyncio.create_task(play(ws)), asyncio.create_task(record(ws))]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for task in done:
+        exc = task.exception()
+        if exc and not isinstance(exc, websockets.ConnectionClosed):
+            print(f"error: {exc!r}", flush=True)
+    print("client disconnected", flush=True)
 
 
 async def main():
     async with websockets.serve(
-        stream, "0.0.0.0", PORT,
+        handle, "0.0.0.0", PORT,
         process_request=check_request,
         compression=None,  # PCM barely compresses; deflate only costs CPU
     ):
-        print(f"listening on port {PORT}", flush=True)
+        print(f"listening on port {PORT} (microphone {'on' if MIC else 'off'})",
+              flush=True)
         await asyncio.Future()
 
 

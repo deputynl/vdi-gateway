@@ -40,13 +40,16 @@ RUN set -eux; \
 
 COPY --chmod=755 entrypoint.sh audio/vdi-audio-server /usr/local/bin/
 
-# Audio player for the web client, loaded by both of its entry pages.
+# Audio player for the web client, loaded by both of its entry pages. The
+# ?v=<content hash> makes browsers and CDNs fetch new versions after an update;
+# vdi-audio.js passes the same query on to the worklet.
 COPY audio/vdi-audio.js audio/vdi-audio-worklet.js /usr/share/kasmvnc/www/
 RUN set -eux; \
+    cd /usr/share/kasmvnc/www; \
+    v="$(cat vdi-audio.js vdi-audio-worklet.js | sha256sum | cut -c1-12)"; \
     for page in index.html vnc.html; do \
-        f="/usr/share/kasmvnc/www/$page"; \
-        sed -i 's|</head>|<script src="./vdi-audio.js" defer></script></head>|' "$f"; \
-        grep -q 'vdi-audio.js' "$f"; \
+        sed -i "s|</head>|<script src=\"./vdi-audio.js?v=$v\" defer></script></head>|" "$page"; \
+        grep -q "vdi-audio.js?v=$v" "$page"; \
     done
 
 USER app

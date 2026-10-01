@@ -54,6 +54,7 @@ To build it yourself instead: clone the repo and run `docker build -t vdi-gatewa
 | `LISTEN_PORT` | `8080` | HTTP/WebSocket port |
 | `AUDIO` | `on` | `on` or `off`: remote audio in the browser (see [Audio](#audio)) |
 | `AUDIO_PORT` | `8081` | Audio WebSocket port |
+| `MIC` | `on` | `on` or `off`: microphone from the browser (needs `AUDIO=on`) |
 
 Secrets never appear on a command line. FreeRDP gets all its arguments through `/args-from:stdin`, `kasmvncpasswd` reads the password from stdin, and both variables are removed from the environment before any child process starts.
 
@@ -164,8 +165,15 @@ KasmVNC has no audio channel, so the gateway adds one. FreeRDP requests the remo
 - The player buffers 60 ms before it starts and drops audio when it falls more than 250 ms behind, so delay stays low.
 - If `KASM_PASSWORD` is set, the audio server requires the same `Authorization` header as KasmVNC. It also rejects WebSocket handshakes whose `Origin` is a different host.
 - On the VM, GNOME Remote Desktop sends audio once the client asks for it. If you hear nothing, check the `[audio]` and `[freerdp]` log lines, then test sound with a native client (`xfreerdp3 /sound ...`).
-- Only playback is supported, no microphone.
 - `AUDIO=off` turns all of it off.
+
+**Microphone** (`MIC=on`, the default). A microphone button appears in the bottom-right corner of the page. It starts **off**. Clicking it asks the browser for microphone permission and then sends your microphone to the remote desktop until you click it again. The browser's recording indicator shows while it is on.
+
+- The audio goes over the same WebSocket in the other direction. The server plays it into a second null sink (`mic`), and FreeRDP records that sink as the remote desktop's microphone (`/microphone:sys:pulse,dev:mic.monitor`).
+- The browser's echo cancellation, noise suppression and auto gain are on, so the remote audio from your speakers isn't sent back.
+- About 0.8 Mbit/s upstream (uncompressed 48 kHz mono) while the microphone is on.
+- The VM's GNOME Remote Desktop must support RDP audio input. To check, connect with a native client using `xfreerdp3 /microphone:sys:pulse ...` and look for a remote microphone in *Settings → Sound* or `pactl list sources short` on the VM.
+- With `MIC=off`, there is no button and FreeRDP announces no microphone.
 
 ## Notes / deviations from the spec
 
