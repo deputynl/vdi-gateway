@@ -1,0 +1,82 @@
+#!/usr/bin/python3 -u
+"""Streams the "rdp" PulseAudio null sink to browsers over WebSocket.
+
+FreeRDP plays the remote desktop's audio into that sink; every connected
+browser gets its monitor as binary messages of raw PCM (s16le, 48 kHz,
+stereo, 20 ms each). Silent chunks are not sent, so an idle desktop costs no
+bandwidth. vdi-audio.js in the web client plays them.
+
+The expected Authorization header ("Basic ..." or an empty line for none) is
+read from stdin so the KasmVNC password never appears in argv or environ.
+"""
+import asyncio
+import hmac
+import http
+import logging
+import os
+import sys
+from urllib.parse import urlsplit
+
+import websockets
+
+PORT = int(os.environ.get("AUDIO_PORT", "8081"))
+SOURCE = "rdp.monitor"
+RATE, CHANNELS = 48000, 2
+CHUNK = RATE // 50 * CHANNELS * 2  # 20 ms of s16le
+SILENCE = bytes(CHUNK)
+
+expected_auth = sys.stdin.readline().strip()
+
+
+def hostname(netloc):
+    return urlsplit("//" + netloc).hostname
+
+
+async def check_request(path, headers):
+    if expected_auth and not hmac.compare_digest(
+        headers.get("Authorization", "").encode(), expected_auth.encode()
+    ):
+        return http.HTTPStatus.UNAUTHORIZED, [], b""
+    # Browsers send cached basic auth credentials with cross-site WebSocket
+    # handshakes too, so only accept pages served from this host.
+    origin = headers.get("Origin")
+    if origin and urlsplit(origin).hostname != hostname(headers.get("Host", "")):
+        return http.HTTPStatus.FORBIDDEN, [], b""
+    return None
+
+
+async def stream(ws, path=None):
+    print("client connected", flush=True)
+    proc = await asyncio.create_subprocess_exec(
+        "parec", f"--device={SOURCE}", "--raw", "--format=s16le",
+        f"--rate={RATE}", f"--channels={CHANNELS}", "--latency-msec=20",
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+    )
+    try:
+        while True:
+            data = await proc.stdout.readexactly(CHUNK)
+            if data != SILENCE:
+                await ws.send(data)
+    except asyncio.IncompleteReadError:
+        print(f"parec exited (code {await proc.wait()})", flush=True)
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        print("client disconnected", flush=True)
+
+
+async def main():
+    async with websockets.serve(
+        stream, "0.0.0.0", PORT,
+        process_request=check_request,
+        compression=None,  # PCM barely compresses; deflate only costs CPU
+    ):
+        print(f"listening on port {PORT}", flush=True)
+        await asyncio.Future()
+
+
+logging.basicConfig(level=logging.WARNING, format="%(message)s")
+asyncio.run(main())

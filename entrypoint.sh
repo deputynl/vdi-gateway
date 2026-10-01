@@ -34,8 +34,12 @@ TARGET_PORT=${TARGET_PORT:-3389}
 LISTEN_PORT=${LISTEN_PORT:-8080}
 RDP_CERT_MODE=${RDP_CERT_MODE:-ignore}
 KASM_USER=${KASM_USER:-kasm}
+AUDIO=${AUDIO:-on}
+AUDIO_PORT=${AUDIO_PORT:-8081}
 [[ $TARGET_PORT =~ ^[0-9]+$ ]] || die "TARGET_PORT must be a number"
 [[ $LISTEN_PORT =~ ^[0-9]+$ ]] || die "LISTEN_PORT must be a number"
+[[ $AUDIO_PORT =~ ^[0-9]+$ ]] || die "AUDIO_PORT must be a number"
+[[ $AUDIO == on || $AUDIO == off ]] || die "AUDIO must be 'on' or 'off', got '$AUDIO'"
 [[ $RDP_CERT_MODE == ignore || $RDP_CERT_MODE == tofu ]] ||
     die "RDP_CERT_MODE must be 'ignore' or 'tofu', got '$RDP_CERT_MODE'"
 
@@ -92,10 +96,16 @@ else
     log "WARNING: anyone who can reach port $LISTEN_PORT controls the remote desktop;"
     log "WARNING: expose this container only through an authenticating reverse proxy."
 fi
+# The audio server accepts exactly the header the web client sends to Xvnc.
+audio_auth=
+[[ -z $kasm_password ]] ||
+    audio_auth="Basic $(printf '%s:%s' "$KASM_USER" "$kasm_password" | base64 -w0)"
 unset kasm_password
 
 start xvnc Xvnc "${xvnc_args[@]}"
 xvnc_pid=$pid
+# PID -> name of the processes whose exit ends the container.
+declare -A critical=([$pid]=Xvnc)
 for _ in $(seq 50); do
     xdpyinfo >/dev/null 2>&1 && break
     kill -0 "$xvnc_pid" 2>/dev/null || die "Xvnc exited during startup"
@@ -109,7 +119,36 @@ log "Xvnc ready on $DISPLAY, web client on http://0.0.0.0:$LISTEN_PORT/"
 # the root window changes size (RandR), which is what the resize chain needs.
 # The xmessage reconnect prompt is shown as a centred dialog instead.
 start wm matchbox-window-manager -use_titlebar no -use_cursor yes -force_dialogs xmessage
-wm_pid=$pid
+critical[$pid]="window manager"
+
+# ----------------------------------------------------------------- audio ---
+# FreeRDP plays into a PulseAudio null sink; vdi-audio-server streams its
+# monitor to the browser over WebSocket on AUDIO_PORT.
+if [[ $AUDIO == on ]]; then
+    export PULSE_SERVER=unix:$run_dir/pulse.sock
+    # Keep Pulse's runtime, state and cookie files in the private run dir.
+    export PULSE_RUNTIME_PATH=$run_dir/pulse PULSE_STATE_PATH=$run_dir/pulse
+    export PULSE_COOKIE=$run_dir/pulse/cookie
+    start pulse pulseaudio --daemonize=no --system=no -n \
+        --exit-idle-time=-1 --realtime=no --high-priority=no --log-target=stderr \
+        -L "module-native-protocol-unix socket=$run_dir/pulse.sock auth-anonymous=1" \
+        -L "module-null-sink sink_name=rdp rate=48000 channels=2 sink_properties=device.description=RDP"
+    critical[$pid]=PulseAudio
+    for _ in $(seq 50); do
+        pactl info >/dev/null 2>&1 && break
+        kill -0 "$pid" 2>/dev/null || die "PulseAudio exited during startup"
+        sleep 0.2
+    done
+    pactl info >/dev/null 2>&1 || die "PulseAudio did not come up"
+
+    export AUDIO_PORT
+    start audio vdi-audio-server < <(printf '%s\n' "$audio_auth")
+    critical[$pid]="audio server"
+    log "audio enabled, WebSocket on port $AUDIO_PORT (route /vdi-audio to it)"
+else
+    log "audio disabled"
+fi
+unset audio_auth
 
 # --------------------------------------------------------------- FreeRDP ---
 log "$(xfreerdp3 /version 2>&1 | head -n1)"
@@ -125,6 +164,7 @@ freerdp_args=(
 )
 [[ -z ${RDP_DOMAIN:-} ]] || freerdp_args+=("/d:$RDP_DOMAIN")
 [[ -z ${KEYBOARD_LAYOUT:-} ]] || freerdp_args+=("/kbd:layout:$KEYBOARD_LAYOUT")
+[[ $AUDIO == off ]] || freerdp_args+=(/sound:sys:pulse,dev:rdp)
 read -r -a extra_args <<<"${FREERDP_EXTRA_ARGS:-}"
 freerdp_args+=("${extra_args[@]}")
 unset rdp_password
@@ -160,14 +200,13 @@ describe_exit() {
     esac
 }
 
-# wait_for PID...: wait until one of Xvnc, the WM or the given PIDs exits.
-# Exits the container if Xvnc or the WM died; otherwise sets $rc.
+# wait_for PID...: wait until a critical process or one of the given PIDs
+# exits. Exits the container if a critical process died; otherwise sets $rc.
 wait_for() {
     local exited
     rc=0
-    wait -n -p exited "$xvnc_pid" "$wm_pid" "$@" || rc=$?
-    [[ $exited != "$xvnc_pid" ]] || die "Xvnc exited (code $rc)"
-    [[ $exited != "$wm_pid" ]] || die "window manager exited (code $rc)"
+    wait -n -p exited "${!critical[@]}" "$@" || rc=$?
+    [[ -z ${critical[$exited]:-} ]] || die "${critical[$exited]} exited (code $rc)"
 }
 
 while true; do

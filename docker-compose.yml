@@ -10,6 +10,8 @@ services:
     ports:
       # Only the reverse proxy should reach this port.
       - 127.0.0.1:8080:8080
+      # Audio WebSocket; the proxy routes /vdi-audio here.
+      - 127.0.0.1:8081:8081
     environment:
       TARGET_HOST: ${TARGET_HOST:?set TARGET_HOST in .env}
       TARGET_PORT: ${TARGET_PORT:-3389}
@@ -22,6 +24,8 @@ services:
       KASM_USER: ${KASM_USER:-kasm}
       KASM_PASSWORD: ${KASM_PASSWORD:-}
       LISTEN_PORT: 8080
+      AUDIO: ${AUDIO:-on}
+      AUDIO_PORT: 8081
     volumes:
       # Known-hosts store for RDP_CERT_MODE=tofu.
       - freerdp-config:/home/app/.config/freerdp

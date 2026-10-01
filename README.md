@@ -8,8 +8,10 @@ One container that shows a FreeRDP 3 session to **one fixed RDP host** in the br
 
 ```
 browser ──HTTP/WS──▶ Xvnc (KasmVNC 1.5.0 + web client, :1)
-                        └── matchbox-window-manager
-                              └── xfreerdp3 3.31 /f +dynamic-resolution ──RDP──▶ TARGET_HOST
+   ▲                    └── matchbox-window-manager
+   │                          └── xfreerdp3 3.32 /f +dynamic-resolution ──RDP──▶ TARGET_HOST
+   │                                    │ /sound
+   └──WS /vdi-audio── vdi-audio-server ◀── PulseAudio null sink
 ```
 
 Built for GNOME Remote Desktop in **Remote Login** mode on Ubuntu 26.04. FreeRDP logs in with the system RDP credentials, the GDM greeter appears, and after you log in FreeRDP follows GNOME's ServerRedirection into your session.
@@ -50,6 +52,8 @@ To build it yourself instead: clone the repo and run `docker build -t vdi-gatewa
 | `FREERDP_EXTRA_ARGS` | – | Extra FreeRDP args, split on whitespace (no quoting) |
 | `KASM_USER` / `KASM_PASSWORD` | `kasm` / unset | KasmVNC basic auth. Unset password = auth **disabled** |
 | `LISTEN_PORT` | `8080` | HTTP/WebSocket port |
+| `AUDIO` | `on` | `on` or `off`: remote audio in the browser (see [Audio](#audio)) |
+| `AUDIO_PORT` | `8081` | Audio WebSocket port |
 
 Secrets never appear on a command line. FreeRDP gets all its arguments through `/args-from:stdin`, `kasmvncpasswd` reads the password from stdin, and both variables are removed from the environment before any child process starts.
 
@@ -107,6 +111,19 @@ server {
         proxy_read_timeout 1800s;
         proxy_send_timeout 1800s;
     }
+
+    # Remote audio (AUDIO=on): same settings, other port.
+    location = /vdi-audio {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header Authorization "Basic a2FzbTpzZWNyZXQ=";   # kasm:secret
+        proxy_buffering off;
+        proxy_read_timeout 1800s;
+        proxy_send_timeout 1800s;
+    }
 }
 ```
 
@@ -115,11 +132,19 @@ Traefik v3 (labels on the `vdi-gateway` service; drop the `ports:` mapping and s
     labels:
       - traefik.enable=true
       - traefik.http.routers.rdp.rule=Host(`rdp.example.com`)
+      - traefik.http.routers.rdp.service=rdp
       - traefik.http.routers.rdp.entrypoints=websecure
       - traefik.http.routers.rdp.tls=true
       - traefik.http.routers.rdp.middlewares=my-idp@file,rdp-basic
       - traefik.http.middlewares.rdp-basic.headers.customrequestheaders.Authorization=Basic a2FzbTpzZWNyZXQ=
       - traefik.http.services.rdp.loadbalancer.server.port=8080
+      # Remote audio (AUDIO=on). The longer rule gives it priority over the router above.
+      - traefik.http.routers.rdp-audio.rule=Host(`rdp.example.com`) && Path(`/vdi-audio`)
+      - traefik.http.routers.rdp-audio.entrypoints=websecure
+      - traefik.http.routers.rdp-audio.tls=true
+      - traefik.http.routers.rdp-audio.middlewares=my-idp@file,rdp-basic
+      - traefik.http.routers.rdp-audio.service=rdp-audio
+      - traefik.http.services.rdp-audio.loadbalancer.server.port=8081
 ```
 Traefik v3 has a 60 s entrypoint `readTimeout` by default. If sessions drop, raise it in the static config: `--entrypoints.websecure.transport.respondingTimeouts.readTimeout=1800s`.
 
@@ -128,13 +153,27 @@ Traefik v3 has a 60 s entrypoint `readTimeout` by default. If sessions drop, rai
 1. System RDP credentials: automatic, from the env vars.
 2. The GDM login screen in the browser: you log in as your normal user, and GNOME hands the connection over to your session.
 
+## Audio
+
+KasmVNC has no audio channel, so the gateway adds one. FreeRDP requests the remote desktop's audio (`/sound:sys:pulse`) and plays it into a PulseAudio null sink in the container. `vdi-audio-server` streams that sink over a WebSocket on `AUDIO_PORT`, and a small player injected into the KasmVNC page (`audio/vdi-audio.js`) plays it.
+
+- The proxy must route **`/vdi-audio`** on the same hostname to port 8081 (examples above). Without that route the desktop works as before, just silently.
+- The page must be served over HTTPS (or from `localhost`): browsers only allow the AudioWorklet player in secure contexts.
+- Sound starts after your first click or key press in the page, because browsers block audio until then.
+- The stream is uncompressed 48 kHz stereo PCM, about 1.5 Mbit/s while something plays. Silence is not sent.
+- The player buffers 60 ms before it starts and drops audio when it falls more than 250 ms behind, so delay stays low.
+- If `KASM_PASSWORD` is set, the audio server requires the same `Authorization` header as KasmVNC. It also rejects WebSocket handshakes whose `Origin` is a different host.
+- On the VM, GNOME Remote Desktop sends audio once the client asks for it. If you hear nothing, check the `[audio]` and `[freerdp]` log lines, then test sound with a native client (`xfreerdp3 /sound ...`).
+- Only playback is supported, no microphone.
+- `AUDIO=off` turns all of it off.
+
 ## Notes / deviations from the spec
 
-- **Base image is Ubuntu 24.04, not 26.04.** KasmVNC 1.5.0 has no 26.04 build. noble-updates ships FreeRDP 3.31.0, the same upstream release as 26.04. Ubuntu only keeps the latest build in -updates, so bump `FREERDP_VERSION` in the Dockerfile when a security update replaces it.
+- **Base image is Ubuntu 24.04, not 26.04.** KasmVNC 1.5.0 has no 26.04 build. noble-updates ships a current FreeRDP 3 (3.32.0 at the time of writing). Ubuntu only keeps the latest build in -updates, so bump `FREERDP_VERSION` in the Dockerfile when a security update replaces it.
 - **No `kasmvnc.yaml`.** `Xvnc` never reads it; only the interactive `kasmvncserver` wrapper does. All settings are Xvnc flags in `entrypoint.sh`, as in linuxserver's baseimage.
 - **WebRTC/UDP**: KasmVNC 1.5.0 has no server switch to turn it off. Xvnc always binds UDP on the same port number. The web client leaves WebRTC off by default, `-publicIP 127.0.0.1` stops STUN lookups, and only TCP is published, so the WebSocket is the only usable transport.
 - **Keyboard**: `-RawKeyboard 1` forwards the physical key (the browser's `event.code`) instead of a US-mapped keysym, so GNOME's own layout applies, as with a native RDP client. `KEYBOARD_LAYOUT` only sets the layout id announced to the server.
-- **`RDP_CERT_MODE=tofu`**: on the first connection FreeRDP 3.31 prints a scary "host key has changed" banner even though nothing was stored yet. It then accepts and stores the cert. Later connections are silent.
+- **`RDP_CERT_MODE=tofu`**: on the first connection FreeRDP (seen with 3.31) prints a scary "host key has changed" banner even though nothing was stored yet. It then accepts and stores the cert. Later connections are silent.
 - The image includes Mesa/LLVM (~180 MB) because the KasmVNC package hard-depends on `libgl1`/`libgbm1`, although nothing uses the GPU.
 
 ## License
